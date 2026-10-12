@@ -329,6 +329,13 @@ install_payload_from_remote() {
 # major Steam updates.
 
 hook_steam_sh() {
+    # opt-in only: the client updater rewrites steam.sh on every update and
+    # modifying it can trigger the client's self-repair. primary mechanisms
+    # are the launch wrapper and the desktop override — this is a fallback.
+    if [ "${KERNELUA_HOOK_STEAMSH:-0}" != "1" ]; then
+        msg "steam.sh hook skipped (opt-in: KERNELUA_HOOK_STEAMSH=1)"
+        return 0
+    fi
     sh_file="$STEAM_DIR/steam.sh"
     so="$STEAM_DIR/kernelua/libkernelua_loader.so"
     begin='# >>> kernelua >>>'
@@ -377,19 +384,57 @@ hook_envd() {
     msg "environment.d hook written: $edir/90-kernelua.conf"
 }
 
+write_wrapper() {
+    wrap="$STEAM_DIR/kernelua/steam-wrap.sh"
+    mkdir -p "$STEAM_DIR/kernelua"
+    {
+        printf '#!/bin/sh\n'
+        printf '# kernelua launch wrapper — ours, never touched by Steam updates\n'
+        printf 'export LD_PRELOAD="%s${LD_PRELOAD:+:$LD_PRELOAD}"\n' "$STEAM_DIR/kernelua/libkernelua_loader.so"
+        printf 'if [ -x /usr/games/steam ]; then exec /usr/games/steam "$@"; fi\n'
+        printf 'if command -v steam >/dev/null 2>&1; then exec steam "$@"; fi\n'
+        printf 'exec "%s/steam.sh" "$@"\n' "$STEAM_DIR"
+    } > "$wrap"
+    chmod +x "$wrap"
+    msg "launch wrapper: $wrap"
+}
+
+hook_desktop() {
+    wrap="$STEAM_DIR/kernelua/steam-wrap.sh"
+    apps="${HOME}/.local/share/applications"
+    mkdir -p "$apps"
+    srcd=""
+    for d in /usr/share/applications /usr/local/share/applications; do
+        if [ -f "$d/steam.desktop" ]; then srcd="$d/steam.desktop"; break; fi
+    done
+    if [ -n "$srcd" ]; then
+        sed "s#^Exec=[^[:space:]]*steam#Exec=$wrap#" "$srcd" > "$apps/steam.desktop"
+    else
+        {
+            printf '[Desktop Entry]\n'
+            printf 'Name=Steam\n'
+            printf 'Comment=Application for managing and playing games on Steam\n'
+            printf 'Exec=%s %%U\n' "$wrap"
+            printf 'Icon=steam\n'
+            printf 'Terminal=false\n'
+            printf 'Type=Application\n'
+            printf 'Categories=Game;\n'
+            printf 'MimeType=x-scheme-handler/steam;x-scheme-handler/steamlink;\n'
+            printf 'StartupWMClass=steam\n'
+        } > "$apps/steam.desktop"
+    fi
+    msg "desktop override: $apps/steam.desktop"
+}
+
 # ----------------------------------------------------------------- start steam
 
 start_steam() {
-    msg "starting Steam"
+    msg "starting Steam via kernelua wrapper"
     if command -v flatpak >/dev/null 2>&1 \
         && flatpak info com.valvesoftware.Steam >/dev/null 2>&1; then
         flatpak run com.valvesoftware.Steam >/dev/null 2>&1 &
-    elif [ -x /usr/games/steam ]; then
-        /usr/games/steam >/dev/null 2>&1 &
-    elif command -v steam >/dev/null 2>&1; then
-        steam >/dev/null 2>&1 &
     else
-        "$STEAM_DIR/steam.sh" >/dev/null 2>&1 &
+        "$STEAM_DIR/kernelua/steam-wrap.sh" >/dev/null 2>&1 &
     fi
 }
 
@@ -415,6 +460,12 @@ diag() {
 
     msg "-- environment.d hook --"
     cat "${HOME}/.config/environment.d/90-kernelua.conf" 2>/dev/null || err "no environment.d hook (update install.sh)"
+
+    msg "-- launch wrapper --"
+    ls -l "$STEAM_DIR/kernelua/steam-wrap.sh" 2>/dev/null || err "no steam-wrap.sh (update install.sh)"
+
+    msg "-- desktop override --"
+    grep -n '^Exec=' "${HOME}/.local/share/applications/steam.desktop" 2>/dev/null || err "no desktop override (menu launches bypass the loader)"
 
     msg "-- flatpak Steam --"
     if command -v flatpak >/dev/null 2>&1 && flatpak info com.valvesoftware.Steam >/dev/null 2>&1; then
@@ -480,9 +531,11 @@ main() {
         install_payload_from_remote
     fi
 
+    write_wrapper
     hook_steam_sh
     hook_flatpak
     hook_envd
+    hook_desktop
     start_steam
 
     iver=$(sed -n 's/.*var VERSION = \([0-9][0-9]*\).*/\1/p' \
