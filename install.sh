@@ -1,4 +1,3 @@
-#!/bin/sh
 # KerneLUA Linux installer — port of install.ps1 (kernelos.org/games/install.ps1)
 #
 # Run it. That's all:
@@ -366,6 +365,17 @@ hook_flatpak() {
     fi
 }
 
+hook_envd() {
+    # systemd user sessions read ~/.config/environment.d — covers launches
+    # that never pass through steam.sh (desktop entries, app menus). takes
+    # effect on next login / session restart. plain KEY=value, no expansion.
+    edir="${HOME}/.config/environment.d"
+    mkdir -p "$edir"
+    printf '# kernelua loader — managed by install.sh\nLD_PRELOAD=%s\n' \
+        "$STEAM_DIR/kernelua/libkernelua_loader.so" > "$edir/90-kernelua.conf"
+    msg "environment.d hook written: $edir/90-kernelua.conf"
+}
+
 # ----------------------------------------------------------------- start steam
 
 start_steam() {
@@ -382,9 +392,75 @@ start_steam() {
     fi
 }
 
+# ----------------------------------------------------------------- diag
+# sh install.sh diag  (or: curl .../install.sh | sh -s diag)
+# prints every link of the chain so a break shows up immediately
+
+diag() {
+    set +e
+    msg "=== kernelua diag ==="
+    STEAM_DIR=$(find_steam_dir)
+    if [ -z "$STEAM_DIR" ]; then
+        err "Steam installation not found"
+        return 1
+    fi
+    msg "steam dir: $STEAM_DIR"
+
+    msg "-- payload ($STEAM_DIR/kernelua) --"
+    ls -la "$STEAM_DIR/kernelua" 2>/dev/null || err "no kernelua/ dir — install never deployed"
+
+    msg "-- steam.sh hook --"
+    grep -n 'kernelua' "$STEAM_DIR/steam.sh" 2>/dev/null || err "no LD_PRELOAD hook in steam.sh"
+
+    msg "-- environment.d hook --"
+    cat "${HOME}/.config/environment.d/90-kernelua.conf" 2>/dev/null || err "no environment.d hook (update install.sh)"
+
+    msg "-- flatpak Steam --"
+    if command -v flatpak >/dev/null 2>&1 && flatpak info com.valvesoftware.Steam >/dev/null 2>&1; then
+        msg "flatpak Steam present"
+        flatpak override --user --show com.valvesoftware.Steam 2>/dev/null | grep -i LD_PRELOAD \
+            || err "flatpak override has no LD_PRELOAD"
+    else
+        msg "no"
+    fi
+
+    msg "-- steam processes and their LD_PRELOAD --"
+    found=0
+    for p in $(pgrep -x steam 2>/dev/null) $(pgrep -f steamwebhelper 2>/dev/null); do
+        found=1
+        printf '  pid %s (%s): ' "$p" "$(tr '\0' ' ' < /proc/$p/cmdline 2>/dev/null | cut -c1-60)"
+        tr '\0' '\n' < "/proc/$p/environ" 2>/dev/null | grep '^LD_PRELOAD=' || echo "LD_PRELOAD NOT SET"
+    done
+    [ "$found" = "0" ] && msg "  steam is not running"
+
+    msg "-- backend process --"
+    pgrep -af 'kernelua/backend' 2>/dev/null || err "backend not running"
+
+    msg "-- backend.log --"
+    tail -n 20 "${HOME}/.kernelua/backend.log" 2>/dev/null || err "no backend.log — backend never started"
+
+    msg "-- loader.log --"
+    tail -n 20 "${HOME}/.kernelua/loader.log" 2>/dev/null || msg "no loader.log (appears after loader.c update + reinstall)"
+
+    msg "-- CDP 127.0.0.1:9222 --"
+    curl -fsS --max-time 3 http://127.0.0.1:9222/json/version 2>/dev/null | head -c 300 || err "CDP not answering — steamwebhelper runs without debugging flags"
+    echo
+
+    msg "-- tools --"
+    command -v python3 >/dev/null 2>&1 && python3 --version
+    if command -v cc >/dev/null 2>&1; then cc --version | head -1
+    elif command -v gcc >/dev/null 2>&1; then gcc --version | head -1; fi
+    msg "=== end ==="
+}
+
 # ----------------------------------------------------------------- main
 
 main() {
+    if [ "${1:-}" = "diag" ]; then
+        diag
+        exit 0
+    fi
+
     [ "$DRY_RUN" = "1" ] && msg "dry run — no changes will be made"
 
     ensure_deps
@@ -405,6 +481,7 @@ main() {
 
     hook_steam_sh
     hook_flatpak
+    hook_envd
     start_steam
 
     iver=$(sed -n 's/.*var VERSION = \([0-9][0-9]*\).*/\1/p' \
