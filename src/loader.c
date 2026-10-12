@@ -44,6 +44,32 @@ extern char **environ;
 static const char *kCdPortArg = "--remote-debugging-port=" CDP_PORT;
 static const char *kCdOriginsArg = "--remote-allow-origins=*";
 
+/* breadcrumb log: ~/.kernelua/loader.log — proves the .so was loaded
+ * even when the backend never gets spawned */
+static void klog(const char *fmt, ...)
+{
+    const char *home = getenv("HOME");
+    if (!home || !*home)
+        return;
+
+    char dir[PATH_MAX], path[PATH_MAX];
+    if (snprintf(dir, sizeof(dir), "%s/.kernelua", home) >= (int)sizeof(dir))
+        return;
+    mkdir(dir, 0755);
+    if (snprintf(path, sizeof(path), "%s/loader.log", dir) >= (int)sizeof(path))
+        return;
+
+    int fd = open(path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+    if (fd < 0)
+        return;
+
+    va_list ap;
+    va_start(ap, fmt);
+    vdprintf(fd, fmt, ap);
+    va_end(ap);
+    close(fd);
+}
+
 /* ------------------------------------------------------------------ */
 /* helpers                                                            */
 /* ------------------------------------------------------------------ */
@@ -107,6 +133,7 @@ static char **augment_argv(char *const argv[], size_t *count_out)
     na[j] = NULL;
     if (count_out)
         *count_out = j;
+    klog("webhelper argv rewritten (cdp %s)\n", CDP_PORT);
     return na;
 }
 
@@ -154,13 +181,17 @@ static void spawn_backend(void)
         return;
     snprintf(backend, sizeof(backend), "%s/backend.py", so_path);
 
-    if (access(backend, X_OK) != 0)
+    if (access(backend, X_OK) != 0) {
+        klog("backend.py missing or not executable: %s\n", backend);
         return;
+    }
 
     /* detach: fork -> setsid -> fork -> exec */
     pid_t pid = fork();
-    if (pid < 0)
+    if (pid < 0) {
+        klog("fork failed: %d\n", errno);
         return;
+    }
     if (pid > 0) {
         waitpid(pid, NULL, 0); /* reap intermediate */
         return;
@@ -201,8 +232,15 @@ static void init_loader(void)
     if (cmdline[0] == '\0')
         return;
 
-    if (is_steam_client(cmdline) && !backend_already_running())
-        spawn_backend();
+    if (is_steam_client(cmdline)) {
+        klog("client loaded pid=%d\n", (int)getpid());
+        if (backend_already_running()) {
+            klog("backend already running\n");
+        } else {
+            klog("spawning backend\n");
+            spawn_backend();
+        }
+    }
     /* webhelper needs no init work here: the exec hook in the client
      * process is what rewrites its command line */
 }
