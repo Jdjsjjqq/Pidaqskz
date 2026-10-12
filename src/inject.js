@@ -9,6 +9,13 @@
  *   JS  -> window.__kernelua_call(JSON.stringify({id, method, params}))
  *   CDP -> backend "Runtime.bindingCalled"
  *   backend -> Runtime.evaluate("window.__kernelua_dispatch(id, resultJson)")
+ *
+ * v2: the store page in the client is a React app — the purchase block can
+ * mount long after DOMContentLoaded and gets replaced on SPA navigation.
+ * Mounting is therefore retry-based with a MutationObserver, the appid is
+ * resolved from the URL first (GetForegroundApp reports the *running* app,
+ * not the page being viewed), and the button container falls back through
+ * several anchors so it always ends up somewhere visible.
  */
 
 (function () {
@@ -20,8 +27,15 @@
     run: { inProgress: false, appid: null, status: 'idle', error: null },
     cache: new Map(),
     logs: {},
-    timer: null
+    timer: null,
+    lastHref: location.href,
+    lastAppId: null
   };
+
+  function log() {
+    try { console.log.apply(console, ['[kernelua]'].concat([].slice.call(arguments))); }
+    catch (e) { /* no console */ }
+  }
 
   // ------------------------------------------------------------- RPC
 
@@ -80,7 +94,7 @@
     '.kernelua-footer a { color:#6bb5d6; text-decoration:none; }',
     '.kernelua-btn { border-radius:3px; cursor:pointer; font-size:12px; font-weight:500; padding:8px 16px;',
     '  margin:4px; min-width:80px; text-align:center; display:inline-block; border:1px solid transparent;',
-    '  transition: all .2s; }',
+    '  transition: all .2s; user-select:none; }',
     '.kernelua-btn-primary { background:#1976D2; border-color:#1976D2; color:#fff; }',
     '.kernelua-btn-primary:hover { background:#1E88E5; }',
     '.kernelua-btn-secondary { background:#1e2329; border-color:#3D4450; color:#8F98A0; }',
@@ -98,7 +112,7 @@
     '.kernelua-compat-badge { display:inline-flex; align-items:center; gap:8px; font-size:13px;',
     '  padding:4px 10px; border-radius:12px; background:rgba(0,0,0,.3); border:1px solid rgba(255,255,255,.12); }',
     '.kernelua-compat-dot { width:9px; height:9px; border-radius:50%; background:#888; }',
-    '.kernelua-button-container { margin:6px 0; }',
+    '.kernelua-button-container { margin:8px 0; }',
     '#kernelua-in-library-banner { margin:8px 0; }',
     '@keyframes kerneluaFadeIn { from { opacity: 0; } to { opacity: 1; } }',
     '@keyframes kerneluaSlideIn { from { transform: translateY(12px); opacity: 0; } to { transform: none; opacity: 1; } }'
@@ -159,20 +173,68 @@
 
   // ------------------------------------------------------------- appid
 
+  function parseAppIdFromUrl(href) {
+    var s = String(href || '');
+    var m = s.match(/\/app\/(?:agecheck\/)?(\d+)/i) ||
+            s.match(/\/agecheck\/app\/(\d+)/i) ||
+            s.match(/[?&#]appid=(\d+)/i) ||
+            s.match(/steam:\/\/(?:store\/|rungameid\/)?(\d+)/i);
+    return m ? parseInt(m[1], 10) : null;
+  }
+
   function getCurrentAppId() {
-    try {
-      if (typeof SteamClient !== 'undefined' &&
-          typeof SteamClient.Apps?.GetForegroundApp === 'function') {
-        var id = SteamClient.Apps.GetForegroundApp();
-        if (id > 0) return id;
-      }
-    } catch (e) { /* fall through */ }
-    var d = document.querySelector('[data-appid]');
+    // 1. URL — the only source that reports the page being *viewed*.
+    //    GetForegroundApp reports the app being *run*, so it is a fallback.
+    var id = parseAppIdFromUrl(location.href) ||
+             parseAppIdFromUrl(location.hash) ||
+             parseAppIdFromUrl(location.search);
+    if (id && id > 0) return id;
+
+    // 2. store markup attributes
+    var d = document.querySelector('[data-appid]') ||
+            document.querySelector('[data-ds-appid]');
     if (d) {
-      var v = parseInt(d.getAttribute('data-appid'), 10);
+      var v = parseInt(d.getAttribute('data-appid') || d.getAttribute('data-ds-appid'), 10);
       if (v > 0) return v;
     }
+
+    // 3. client bridge
+    try {
+      if (typeof SteamClient !== 'undefined' && SteamClient.Apps &&
+          typeof SteamClient.Apps.GetForegroundApp === 'function') {
+        var s = SteamClient.Apps.GetForegroundApp();
+        if (s > 0) return s;
+      }
+    } catch (e) { /* bridge not on this page */ }
+
     return null;
+  }
+
+  // ------------------------------------------------------------- container
+
+  function findContainer() {
+    var selectors = [
+      '#game_area_purchase',
+      '.game_area_purchase_game_wrapper',
+      '.game_area_purchase_game',
+      '.game_area_purchase',
+      '[data-component="StoreSaleWidget"]',
+      '.PurchaseArea',
+      '#game_area_description',
+      '.game_area_description',
+      '.game_area_details_specs',
+      '.game_page_autocollapse'
+    ];
+    for (var i = 0; i < selectors.length; i++) {
+      var el = document.querySelector(selectors[i]);
+      if (el) return el;
+    }
+    var title = document.querySelector('.apphub_AppName') ||
+                document.querySelector('#appHubAppName_responsive') ||
+                document.querySelector('#appHubAppName') ||
+                document.querySelector('h1');
+    if (title && title.parentNode) return title.parentNode;
+    return document.body;
   }
 
   // ------------------------------------------------------------- compat
@@ -209,6 +271,7 @@
     if (document.querySelector('.kernelua-compat-wrap')) return;
     var container = document.querySelector('.game_area_description') ||
                     document.querySelector('#game_area_description') ||
+                    document.querySelector('.game_area_details_specs') ||
                     document.body;
     if (!container) return;
 
@@ -266,7 +329,7 @@
   // ------------------------------------------------------------- token modal
 
   function showActivateModal(onDone) {
-    var m = createModal('KerneLua - Activate Plugin');
+    var m = createModal('KerneLUA - Activate Plugin');
     var desc = document.createElement('div');
     desc.style.cssText = 'font-size:13px;color:#8F98A0;margin:0 0 2px 0;line-height:1.5;';
     desc.innerHTML = 'Get your free token at: <a class="kernelua-token-link" ' +
@@ -301,23 +364,37 @@
 
   // ------------------------------------------------------------- buttons
 
+  // store classes are kept for the classic markup; kernelua-btn classes and
+  // inline styles guarantee a visible button even on the React store where
+  // btn_blue_steamui has no stylesheet.
+  function buildStoreButton(label, onClick) {
+    var button = document.createElement('div');
+    button.className = 'btn_blue_steamui btn_medium kernelua-btn kernelua-btn-primary';
+    button.textContent = label;
+    button.style.cssText = 'display:inline-block; margin:4px 0 4px 2px; padding:8px 16px;' +
+      ' background:#1976D2; color:#fff; border:1px solid #1976D2; border-radius:3px;' +
+      ' font-size:12px; font-weight:500; cursor:pointer; user-select:none;';
+    if (onClick) button.addEventListener('click', onClick);
+    return button;
+  }
+
+  function removeInjected() {
+    var nodes = document.querySelectorAll('.kernelua-button-container, #kernelua-in-library-banner');
+    for (var i = 0; i < nodes.length; i++) nodes[i].remove();
+  }
+
   function createAndInjectButton(appId) {
     if (document.querySelector('.kernelua-button-container')) return;
-    var container = document.querySelector('.game_area_purchase_game') ||
-                    document.querySelector('.game_area_purchase') ||
-                    document.querySelector('#game_area_purchase');
+    var container = findContainer();
     if (!container) return;
 
     var btnContainer = document.createElement('div');
     btnContainer.className = 'btn_addtocart btn_packageinfo kernelua-button-container';
     btnContainer.dataset.kerneluaKind = 'add';
-    var button = document.createElement('div');
-    button.className = 'btn_blue_steamui btn_medium';
-    button.textContent = 'Add via KerneLua';
-    button.style.marginLeft = '2px';
-    button.addEventListener('click', function () {
+
+    var button = buildStoreButton('Add via KerneLua', function () {
       ensureTokenThen(function () {
-        var m = createModal('KerneLua - Working');
+        var m = createModal('KerneLUA - Working');
         var progress = document.createElement('div');
         progress.className = 'kernelua-progress';
         progress.style.display = 'block';
@@ -351,42 +428,43 @@
         });
       });
     });
+
     btnContainer.appendChild(button);
     container.appendChild(btnContainer);
+    log('add button mounted for appid', appId, '->', container.tagName,
+        container.id || container.className || '(body)');
   }
 
   function createRemoveButton(appId) {
     if (document.querySelector('.kernelua-button-container')) return;
-    var container = document.querySelector('.game_area_purchase_game') ||
-                    document.querySelector('.game_area_purchase') ||
-                    document.querySelector('#game_area_purchase');
+    var container = findContainer();
     if (!container) return;
 
     var btnContainer = document.createElement('div');
     btnContainer.className = 'btn_addtocart btn_packageinfo kernelua-button-container';
     btnContainer.dataset.kerneluaKind = 'remove';
-    var button = document.createElement('div');
-    button.className = 'btn_blue_steamui btn_medium';
-    button.textContent = 'Remove via KerneLua';
-    button.style.marginLeft = '2px';
-    button.addEventListener('click', function () {
+
+    var button = buildStoreButton('Remove via KerneLua', function () {
       rpc('RemoveViaKernelua', { appid: appId }).then(function (r) {
         if (r && r.success) {
           state.cache.delete('appExists_' + appId);
         }
+        removeInjected();
         addKerneluaButton();
-      }).catch(function () { addKerneluaButton(); });
+      }).catch(function () { removeInjected(); addKerneluaButton(); });
     });
+
     btnContainer.appendChild(button);
     container.appendChild(btnContainer);
   }
 
   function showLibraryBanners() {
     if (document.querySelector('#kernelua-in-library-banner')) return;
-    var container = document.querySelector('.game_area_purchase_game') ||
-                    document.querySelector('.game_area_purchase') ||
-                    document.body;
-    var name = (document.querySelector('.apphub_AppName') || {}).textContent || 'This game';
+    var container = findContainer();
+    if (!container) return;
+    var name = (document.querySelector('.apphub_AppName') ||
+                document.querySelector('#appHubAppName_responsive') ||
+                {}).textContent || 'This game';
     var msg = document.createElement('div');
     msg.id = 'kernelua-in-library-banner';
     msg.className = 'already_in_library';
@@ -406,7 +484,7 @@
     if (!appId) {
       if (!state.logs.missingOnce) {
         state.logs.missingOnce = true;
-        console.log('[kernelua] no appid on this page');
+        log('no appid on this page yet:', location.href);
       }
       return;
     }
@@ -415,7 +493,7 @@
 
     function render(exists) {
       state.cache.set(key, exists);
-      document.querySelector('.kernelua-button-container')?.remove();
+      removeInjected();
       if (exists === true) {
         createRemoveButton(appId);
         showLibraryBanners();
@@ -433,13 +511,71 @@
     }).catch(function () { render(false); });
   }
 
+  // ------------------------------------------------------------- mount / navigation
+
+  var searchTimer = null;
+  var searchTries = 0;
+
+  function scheduleButtonSearch() {
+    if (searchTimer) clearInterval(searchTimer);
+    searchTries = 0;
+    addKerneluaButton();
+    searchTimer = setInterval(function () {
+      searchTries++;
+      if (!document.querySelector('.kernelua-button-container')) {
+        addKerneluaButton();
+      }
+      if (document.querySelector('.kernelua-button-container') || searchTries > 60) {
+        clearInterval(searchTimer);
+        searchTimer = null;
+      }
+    }, 500);
+  }
+
+  function onPageChanged() {
+    state.lastHref = location.href;
+    state.cache.clear();
+    state.logs = {};
+    removeInjected();
+    log('page changed ->', location.href);
+    try {
+      var info = kerneluaAnalyzeCompat();
+      kerneluaMakeBadge(info);
+    } catch (e) { /* non-fatal */ }
+    scheduleButtonSearch();
+  }
+
+  function watchNavigation() {
+    // SPA route change: the store swaps pages without DOMContentLoaded
+    setInterval(function () {
+      if (location.href !== state.lastHref) onPageChanged();
+    }, 1000);
+
+    // React mounts the purchase block late and can replace it wholesale
+    try {
+      var obs = new MutationObserver(function () {
+        try {
+          if (location.href !== state.lastHref) {
+            onPageChanged();
+            return;
+          }
+          if (!document.querySelector('.kernelua-button-container') && getCurrentAppId()) {
+            addKerneluaButton();
+          }
+        } catch (e) { /* frame is going away */ }
+      });
+      obs.observe(document.documentElement, { childList: true, subtree: true });
+    } catch (e) { /* no MutationObserver — interval above still covers it */ }
+  }
+
   function initKernelua() {
     ensureStyles();
     try {
       var info = kerneluaAnalyzeCompat();
       kerneluaMakeBadge(info);
     } catch (e) { /* non-fatal */ }
-    setTimeout(addKerneluaButton, 100);
+    scheduleButtonSearch();
+    watchNavigation();
   }
 
   if (document.readyState === 'loading') {
