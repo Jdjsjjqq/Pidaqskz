@@ -13,12 +13,15 @@ The Windows backend is a console PE that (per import table + embedded JS):
 This port keeps stdlib-only Python:
   - single instance via the abstract unix socket @kernelua_backend
     (the loader probes the same socket before spawning us),
-  - CEF attach over the Chrome DevTools Protocol on 127.0.0.1:9222 —
-    the loader rewrites steamwebhelper's argv to open that port,
+  - CEF attach over the Chrome DevTools Protocol — port discovered at runtime
+    (our forced 9222 via the loader rewrite, or Steam's own hard-coded 8080),
   - injection via Page.addScriptToEvaluateOnNewDocument + Runtime.addBinding
     (the binding replaces the in-process hook the DLL used for RPC),
   - the same RPC surface: GetStatus / hasLuaForApp / addViaKernelua /
     RemoveViaKernelua / saveToken / getToken.
+
+Endpoint discovery / peer auth / UI-ready gating ported from
+swwayps/luatools-moon (Lumen: cefport.lua, peerauth.lua, injector.lua).
 
 NOTE on upstream endpoints: the exact kernelos.org API paths are not
 published in the client strings (the JS only talks to the local backend).
@@ -45,7 +48,16 @@ import urllib.request
 
 CFG = {
     "cdp_host": "127.0.0.1",
-    "cdp_port": int(os.environ.get("KERNELUA_CDP_PORT", "9222")),
+    # CEF remote-debugging port candidates, probed in order (luatools-moon /
+    # Lumen cefport pattern): env override, our forced 9222 (loader rewrite),
+    # then Steam's own hard-coded 8080 (vanilla steamwebhelper / Decky-style).
+    "cdp_ports": tuple(
+        p for p in (
+            int(os.environ["KERNELUA_CDP_PORT"]) if os.environ.get("KERNELUA_CDP_PORT", "").isdigit() else None,
+            9222,
+            8080,
+        ) if p is not None
+    ),
     "api_base": os.environ.get("KERNELUA_API_BASE", "https://kernelos.org/games"),
     # inferred — verify against the live site API and fix here
     "api_haslua": "/api/haslua?appid={appid}",
@@ -268,7 +280,7 @@ class CdpPage:
     """One attached page target. Reader thread dispatches events."""
 
     def __init__(self, ws_url):
-        # ws://127.0.0.1:9222/devtools/page/<id>
+        # ws://127.0.0.1:<port>/devtools/page/<id>
         u = urllib.parse.urlparse(ws_url)
         self.ws = WebSocket(u.hostname, u.port, u.path)
         self.next_id = 0
@@ -520,7 +532,119 @@ def event_loop(pages, cfg, rpc):
         time.sleep(0.25)
 
 
-# ----------------------------------------------------------------- main
+# ------------------------------------------- CEF endpoint discovery (Lumen port)
+# Ported from swwayps/luatools-moon (Lumen cefport.lua + peerauth.lua +
+# injector.lua READY_MARKERS). Vanilla Steam already exposes a CEF remote
+# debugging endpoint on 127.0.0.1:8080; our loader rewrite forces 9222 on the
+# 64-bit helper side. Probe both, and never trust a port whose listening socket
+# is owned by something that is not the Steam client (loopback squatting).
+
+STEAM_COMMS = ("steam", "steam.sh", "steamwebhelper", "steamwebhelper.exe")
+
+# UI ready markers (Lumen injector.lua): the shell only shows these after
+# login + first paint. Attaching before that stalls boot / blanks the render.
+READY_MARKERS = (
+    "Supernav",
+    "Root Menu",
+    "store.steampowered.com",
+    "Steam Big Picture Mode",
+    "QuickAccess_",
+    "MainMenu_",
+)
+
+
+def socket_owner_comm(port):
+    """comm of the process owning the TCP LISTEN socket on `port`, or None.
+
+    Kernel-truth peerauth-lite (peerauth.lua idea): match the socket inode
+    from /proc/net/tcp{,6} against /proc/<pid>/fd. None means 'no listener'
+    or 'cannot determine'.
+    """
+    inodes = set()
+    for path in ("/proc/net/tcp", "/proc/net/tcp6"):
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                next(fh, None)
+                for line in fh:
+                    parts = line.split()
+                    if len(parts) < 10 or parts[3] != "0A":  # TCP_LISTEN
+                        continue
+                    try:
+                        if int(parts[1].rsplit(":", 1)[1], 16) == port:
+                            inodes.add(parts[9])
+                    except (ValueError, IndexError):
+                        continue
+        except OSError:
+            continue
+    if not inodes:
+        return None
+    try:
+        pids = os.listdir("/proc")
+    except OSError:
+        return None
+    for pid in pids:
+        if not pid.isdigit():
+            continue
+        fd_dir = f"/proc/{pid}/fd"
+        try:
+            fds = os.listdir(fd_dir)
+        except OSError:
+            continue
+        for fd in fds:
+            try:
+                tgt = os.readlink(f"{fd_dir}/{fd}")
+            except OSError:
+                continue
+            if tgt.startswith("socket:[") and tgt[8:-1] in inodes:
+                try:
+                    with open(f"/proc/{pid}/comm", "r", encoding="utf-8") as fh:
+                        return fh.read().strip()
+                except OSError:
+                    return "unknown"
+    return None
+
+
+def probe_cef(host, port):
+    """True when a CEF DevTools endpoint answers on host:port."""
+    try:
+        with urllib.request.urlopen(
+            f"http://{host}:{port}/json/version", timeout=2
+        ) as resp:
+            body = resp.read(512).decode("utf-8", "replace")
+        return "webSocketDebuggerUrl" in body or "Browser" in body
+    except (urllib.error.URLError, OSError, ValueError):
+        return False
+
+
+def discover_cef_port(cfg):
+    """First candidate port whose listener is (or looks like) the Steam client.
+
+    Returns (port, comm) or (None, reason).
+    """
+    for port in cfg["cdp_ports"]:
+        if not probe_cef(cfg["cdp_host"], port):
+            continue
+        comm = socket_owner_comm(port)
+        if (
+            os.environ.get("KERNELUA_CDP_INSECURE") != "1"
+            and comm is not None
+            and comm != "unknown"
+            and not any(comm == c or comm.startswith(c) for c in STEAM_COMMS)
+        ):
+            log(f"port {port}: listener '{comm}' is not Steam — refusing (squat)")
+            continue
+        return port, comm or "unknown"
+    return None, "no CEF endpoint answering"
+
+
+def targets_ui_ready(targets):
+    """Lumen injector.targets_ui_ready — past login + first paint?"""
+    for t in targets or []:
+        hay = f"{t.get('title') or ''} {t.get('url') or ''}"
+        if any(m in hay for m in READY_MARKERS):
+            return True
+    return False
+
 
 def acquire_instance_lock(name):
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -543,10 +667,13 @@ def main():
 
     threading.Thread(target=event_loop, args=(pages, CFG, rpc), daemon=True).start()
 
-    host, port = CFG["cdp_host"], CFG["cdp_port"]
-    log(f"waiting for CDP on {host}:{port} (inject.js v{INJECT_VERSION})")
-    deadline = time.time() + CFG["cdp_ready_timeout"]
+    host = CFG["cdp_host"]
+    ports_txt = "/".join(str(p) for p in CFG["cdp_ports"])
+    log(f"backend start (inject.js v{INJECT_VERSION}); CEF candidates: {ports_txt}")
     attached = {}  # target id -> CdpPage
+    port_logged = None
+    ready_logged = False
+    wait_logged = 0.0
 
     while True:
         # accept/drain lock connections so the loader probe sees "running"
@@ -557,21 +684,39 @@ def main():
         except (socket.timeout, OSError):
             pass
 
+        # re-resolve every cycle: Steam restarts rotate the endpoint
+        port, why = discover_cef_port(CFG)
+        if port is None:
+            if time.time() > wait_logged:
+                log(f"CEF endpoint not up ({why}), still waiting")
+                wait_logged = time.time() + 60.0
+            time.sleep(CFG["poll_interval"])
+            continue
+        if port != port_logged:
+            log(f"CEF port: {port} (listener: {why})")
+            port_logged = port
+
         try:
             targets = list_targets(host, port)
         except OSError:
             targets = []
 
-        wanted = [
-            t for t in targets
-            if t.get("type") == "page"
-            and (
-                "steamloopback.host" in (t.get("url") or "")
-                or "Steam" in (t.get("title") or "")
-            )
-        ]
+        # Lumen lesson: do not attach before login + first paint — it stalls
+        # Steam's boot and blanks the render. Wait for a ready marker.
+        if not targets_ui_ready(targets):
+            if not ready_logged:
+                log("Steam UI not ready yet — holding injection")
+                ready_logged = True
+            time.sleep(CFG["poll_interval"])
+            continue
+        if ready_logged:
+            log("Steam UI ready — injecting")
+            ready_logged = False
 
-        # drop dead sessions, then attach only new target ids
+        # every page target: shell, store webviews, SharedJSContext
+        wanted = [t for t in targets if t.get("type") == "page"]
+
+        # drop dead sessions (webhelper restarts), attach only new target ids
         for tid in list(attached):
             if attached[tid].dead:
                 del attached[tid]
@@ -589,11 +734,6 @@ def main():
                 log(f"attach failed: {exc}")
 
         pages[:] = list(attached.values())
-
-        if not pages and time.time() > deadline:
-            log("no steam UI targets found, still waiting")
-            deadline = time.time() + 60.0
-
         time.sleep(CFG["poll_interval"])
 
 
