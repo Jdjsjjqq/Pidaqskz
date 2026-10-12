@@ -109,8 +109,29 @@ build_loader() {
     fi
 
     mkdir -p "$(dirname "$out")"
-    msg "building loader ($CC)"
+    msg "building loader ($CC, 64-bit)"
     "$CC" -O2 -fPIC -shared -ldl "$src" -o "$out"
+
+    # 32-bit build: the Steam client core (ubuntu12_32/steam) is a 32-bit
+    # binary and silently ignores a 64-bit LD_PRELOAD. Build both classes
+    # into lib64/ + lib32/ so each process loads the matching one (Lumen /
+    # slsteam-moon lesson). Best effort: skip quietly without a multilib toolchain.
+    stage=$(dirname "$out")
+    mkdir -p "$stage/lib64" "$stage/lib32"
+    cp "$out" "$stage/lib64/"
+    if echo 'int kua_m32;' | "$CC" -m32 -x c - -shared -o "$stage/lib32/.probe" 2>/dev/null; then
+        rm -f "$stage/lib32/.probe"
+        msg "building loader ($CC, 32-bit)"
+        if "$CC" -m32 -O2 -fPIC -shared -ldl "$src" -o "$stage/lib32/libkernelua_loader.so" 2>/dev/null; then
+            msg "32-bit loader built"
+        else
+            rm -f "$stage/lib32/libkernelua_loader.so"
+            msg "warning: 32-bit loader build failed — client core keeps vanilla CEF port 8080"
+        fi
+    else
+        rm -f "$stage/lib32/.probe"
+        msg "warning: no 32-bit toolchain (-m32) — client core keeps vanilla CEF port 8080"
+    fi
 }
 
 # ----------------------------------------------------------------- dependency bootstrap
@@ -243,6 +264,33 @@ ensure_deps() {
     done
 }
 
+# optional: 32-bit toolchain for the 32-bit loader (client core). non-fatal —
+# without it the backend still works through the vanilla CEF port 8080.
+
+ensure_multilib() {
+    printf 'int kua_m32_probe;' | ${CC:-cc} -m32 -x c - -shared -o /dev/null 2>/dev/null && return 0
+
+    msg "no 32-bit toolchain (-m32) — trying to install multilib support"
+    RUN_AS=""
+    if [ "$(id -u)" -ne 0 ]; then
+        command -v sudo >/dev/null 2>&1 || { msg "warning: no sudo — skipping multilib"; return 0; }
+        RUN_AS="sudo"
+    fi
+    mgr=$(detect_pkg_mgr) || { msg "warning: no package manager — skipping multilib"; return 0; }
+    case "$mgr" in
+        apt-get)   pkgs="gcc-multilib" ;;
+        dnf|yum)   pkgs="glibc-devel.i686 libgcc.i686" ;;
+        pacman)    pkgs="gcc-multilib" ;;
+        zypper)    pkgs="gcc-32bit glibc-devel-32bit" ;;
+        *)         pkgs="" ;;
+    esac
+    [ -n "$pkgs" ] || return 0
+    # shellcheck disable=SC2086
+    run_pkg_install "$mgr" $pkgs 2>/dev/null || msg "warning: multilib install failed — skipping 32-bit loader"
+    printf 'int kua_m32_probe;' | ${CC:-cc} -m32 -x c - -shared -o /dev/null 2>/dev/null \
+        || msg "warning: still no -m32 — 32-bit loader will be skipped"
+}
+
 # ----------------------------------------------------------------- download ladder
 # tier 1: direct fetch (Invoke-WebRequest)
 # tier 2: DoH resolve + fetch via resolved IP with SNI/Host (CertBypass + WebClient)
@@ -291,6 +339,8 @@ install_payload_from_source() {
     build_loader "$SCRIPT_DIR/src/loader.c" "$SCRIPT_DIR/build/libkernelua_loader.so" || return 1
     mkdir -p "$STEAM_DIR/kernelua"
     cp "$SCRIPT_DIR/build/libkernelua_loader.so" "$STEAM_DIR/kernelua/"
+    cp -r "$SCRIPT_DIR/build/lib64" "$STEAM_DIR/kernelua/" 2>/dev/null || true
+    cp -r "$SCRIPT_DIR/build/lib32" "$STEAM_DIR/kernelua/" 2>/dev/null || true
     cp "$SCRIPT_DIR/src/backend.py" "$STEAM_DIR/kernelua/"
     cp "$SCRIPT_DIR/src/inject.js" "$STEAM_DIR/kernelua/"
     chmod +x "$STEAM_DIR/kernelua/backend.py"
@@ -316,6 +366,8 @@ install_payload_from_remote() {
 
     mkdir -p "$STEAM_DIR/kernelua"
     cp "$work/libkernelua_loader.so" "$STEAM_DIR/kernelua/"
+    cp -r "$work/lib64" "$STEAM_DIR/kernelua/" 2>/dev/null || true
+    cp -r "$work/lib32" "$STEAM_DIR/kernelua/" 2>/dev/null || true
     cp "$work/backend.py" "$STEAM_DIR/kernelua/"
     cp "$work/inject.js" "$STEAM_DIR/kernelua/"
     chmod +x "$STEAM_DIR/kernelua/backend.py"
@@ -386,11 +438,25 @@ hook_envd() {
 
 write_wrapper() {
     wrap="$STEAM_DIR/kernelua/steam-wrap.sh"
-    mkdir -p "$STEAM_DIR/kernelua"
+    kdir="$STEAM_DIR/kernelua"
+    mkdir -p "$kdir"
     {
         printf '#!/bin/sh\n'
         printf '# kernelua launch wrapper — ours, never touched by Steam updates\n'
-        printf 'export LD_PRELOAD="%s${LD_PRELOAD:+:$LD_PRELOAD}"\n' "$STEAM_DIR/kernelua/libkernelua_loader.so"
+        printf '\n'
+        printf '# sidecar: the backend starts HERE (Lumen pattern from luatools-moon),\n'
+        printf '# not from the preload constructor — works regardless of ELF class\n'
+        printf '# and survives whatever the client does with its own binaries.\n'
+        printf 'if [ -x "%s/backend.py" ] && command -v python3 >/dev/null 2>&1; then\n' "$kdir"
+        printf '    mkdir -p "$HOME/.kernelua"\n'
+        printf '    nohup python3 "%s/backend.py" >>"$HOME/.kernelua/backend.spawn.log" 2>&1 &\n' "$kdir"
+        printf 'fi\n'
+        printf '\n'
+        printf '# arch-aware preload: each process picks the matching build\n'
+        printf '# (32-bit client core, 64-bit steamwebhelper) via LD_LIBRARY_PATH\n'
+        printf 'export LD_LIBRARY_PATH="%s/lib64:%s/lib32${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"\n' "$kdir" "$kdir"
+        printf 'export LD_PRELOAD="libkernelua_loader.so${LD_PRELOAD:+:$LD_PRELOAD}"\n'
+        printf '\n'
         printf 'if [ -x /usr/games/steam ]; then exec /usr/games/steam "$@"; fi\n'
         printf 'if command -v steam >/dev/null 2>&1; then exec steam "$@"; fi\n'
         printf 'exec "%s/steam.sh" "$@"\n' "$STEAM_DIR"
@@ -491,12 +557,22 @@ diag() {
     msg "-- backend.log --"
     tail -n 20 "${HOME}/.kernelua/backend.log" 2>/dev/null || err "no backend.log — backend never started"
 
+    msg "-- backend.spawn.log (sidecar stdout/stderr) --"
+    tail -n 20 "${HOME}/.kernelua/backend.spawn.log" 2>/dev/null || err "no backend.spawn.log — wrapper never started the sidecar"
+
     msg "-- loader.log --"
     tail -n 20 "${HOME}/.kernelua/loader.log" 2>/dev/null || msg "no loader.log (appears after loader.c update + reinstall)"
 
-    msg "-- CDP 127.0.0.1:9222 --"
-    curl -fsS --max-time 3 http://127.0.0.1:9222/json/version 2>/dev/null | head -c 300 || err "CDP not answering — steamwebhelper runs without debugging flags"
-    echo
+    msg "-- CEF endpoint probe (9222 = our rewrite, 8080 = vanilla Steam) --"
+    for cdp in 9222 8080; do
+        if curl -fsS --max-time 3 "http://127.0.0.1:$cdp/json/version" >/dev/null 2>&1; then
+            printf '  port %s: UP — ' "$cdp"
+            curl -fsS --max-time 3 "http://127.0.0.1:$cdp/json/version" 2>/dev/null | head -c 200
+            echo
+        else
+            printf '  port %s: down\n' "$cdp"
+        fi
+    done
 
     msg "-- tools --"
     command -v python3 >/dev/null 2>&1 && python3 --version
@@ -516,6 +592,7 @@ main() {
     [ "$DRY_RUN" = "1" ] && msg "dry run — no changes will be made"
 
     ensure_deps
+    ensure_multilib
 
     STEAM_DIR=$(find_steam_dir) || die "Steam installation not found."
     msg "steam dir: $STEAM_DIR"
