@@ -20,8 +20,13 @@
 
 (function () {
   'use strict';
-  if (window.__kernelua_loaded) return;
+  var VERSION = 3;
+  if ((window.__kernelua_loaded_v || 0) >= VERSION) return;
+  // old builds used only __kernelua_loaded; keep it set so an old script
+  // that runs after us bails out, and record the version for the backend
   window.__kernelua_loaded = true;
+  window.__kernelua_loaded_v = VERSION;
+  try { document.documentElement.setAttribute('data-kernelua', String(VERSION)); } catch (e) {}
 
   var state = {
     run: { inProgress: false, appid: null, status: 'idle', error: null },
