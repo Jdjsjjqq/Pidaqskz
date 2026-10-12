@@ -67,6 +67,9 @@ CFG = {
     "binding": "__kernelua_call",
     "poll_interval": 2.0,
     "cdp_ready_timeout": 120.0,
+    # max seconds to hold injection while waiting for a UI-ready marker after
+    # the CEF endpoint appears; past this we attach anyway (version-proof)
+    "boot_settle": 45.0,
 }
 
 # token header is inferred as well; send both common shapes
@@ -333,9 +336,11 @@ class CdpPage:
         return ev
 
 
-def list_targets(host, port):
+def _http_get_json(host, port, path):
     with socket.create_connection((host, port), timeout=3) as s:
-        s.sendall(b"GET /json/list HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        s.sendall(
+            f"GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n".encode()
+        )
         data = b""
         while True:
             chunk = s.recv(65536)
@@ -343,7 +348,25 @@ def list_targets(host, port):
                 break
             data += chunk
     _, _, body = data.partition(b"\r\n\r\n")
-    return json.loads(body.decode("utf-8", "replace"))
+    try:
+        return json.loads(body.decode("utf-8", "replace"))
+    except ValueError:
+        return None
+
+
+def list_targets(host, port):
+    for path in ("/json/list", "/json"):
+        got = _http_get_json(host, port, path)
+        if isinstance(got, list):
+            return got
+    return []
+
+
+def describe_targets(targets, limit=6):
+    parts = []
+    for t in (targets or [])[:limit]:
+        parts.append(f"[{t.get('type')}] {t.get('title')!r} | {t.get('url')!r}")
+    return "; ".join(parts) or "(none)"
 
 
 # ----------------------------------------------------------------- RPC surface
@@ -638,12 +661,24 @@ def discover_cef_port(cfg):
 
 
 def targets_ui_ready(targets):
-    """Lumen injector.targets_ui_ready — past login + first paint?"""
-    for t in targets or []:
+    """Past login + first paint?
+
+    Fast track: a Lumen READY_MARKER (their injector.lua). Fallback: any real
+    page target beyond the bare SharedJSContext stub — client builds title
+    their windows differently, and the store can live as an iframe inside the
+    shell target (our addScriptToEvaluateOnNewDocument covers all frames).
+    """
+    pages = [t for t in targets or [] if t.get("type") == "page"]
+    for t in pages:
         hay = f"{t.get('title') or ''} {t.get('url') or ''}"
         if any(m in hay for m in READY_MARKERS):
             return True
-    return False
+    real = [
+        t for t in pages
+        if "sharedjscontext" not in (t.get("url") or "").lower()
+        and (t.get("url") or "") != "about:blank"
+    ]
+    return len(real) >= 1
 
 
 def acquire_instance_lock(name):
@@ -674,6 +709,8 @@ def main():
     port_logged = None
     ready_logged = False
     wait_logged = 0.0
+    hold_logged = 0.0
+    endpoint_since = None  # when the CEF endpoint first appeared this session
 
     while True:
         # accept/drain lock connections so the loader probe sees "running"
@@ -696,21 +733,32 @@ def main():
             log(f"CEF port: {port} (listener: {why})")
             port_logged = port
 
+        if endpoint_since is None:
+            endpoint_since = time.time()
+
         try:
             targets = list_targets(host, port)
         except OSError:
             targets = []
 
         # Lumen lesson: do not attach before login + first paint — it stalls
-        # Steam's boot and blanks the render. Wait for a ready marker.
-        if not targets_ui_ready(targets):
+        # Steam's boot and blanks the render. Hold for a ready marker, but
+        # never forever: after boot_settle seconds past the endpoint's first
+        # appearance the client is up by any reasonable measure — proceed.
+        ready = targets_ui_ready(targets)
+        if not ready and time.time() - endpoint_since < CFG["boot_settle"]:
             if not ready_logged:
                 log("Steam UI not ready yet — holding injection")
                 ready_logged = True
+            if time.time() > hold_logged:
+                log(f"targets so far: {describe_targets(targets)}")
+                hold_logged = time.time() + 30.0
             time.sleep(CFG["poll_interval"])
             continue
+        if not ready:
+            log(f"boot settle ({CFG['boot_settle']}s) elapsed — proceeding without a ready marker")
         if ready_logged:
-            log("Steam UI ready — injecting")
+            log(f"Steam UI ready — injecting ({describe_targets(targets)})")
             ready_logged = False
 
         # every page target: shell, store webviews, SharedJSContext
