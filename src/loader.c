@@ -186,16 +186,8 @@ static void spawn_backend(void)
            e.g. .../kernelua/lib32/libkernelua_loader.so -> ../backend.py */
         char *s2 = strrchr(so_path, '/');
         if (s2) {
-            *s2 = '\0';
-            char *s3 = strrchr(so_path, '/');
-            if (s3) {
-                size_t parent_len = (size_t)(s3 - so_path);
-                if (parent_len + 12 < sizeof(backend)) {
-                    memcpy(backend, so_path, parent_len);
-                    backend[parent_len] = '\0';
-                    strcat(backend, "/backend.py");
-                }
-            }
+            *s2 = '\0'; /* parent of the .so's dir */
+            snprintf(backend, sizeof(backend), "%s/backend.py", so_path);
         }
     }
 
@@ -474,4 +466,4 @@ int posix_spawnp(pid_t *pid, const char *file,
     int r = real_posix_spawnp(pid, file, fa, attr, na ? na : argv, envp);
     free(na);
     return r;
-} 
+}
