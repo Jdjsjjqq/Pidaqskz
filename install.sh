@@ -1,3 +1,4 @@
+#!/bin/sh
 # KerneLUA Linux installer — port of install.ps1 (kernelos.org/games/install.ps1)
 #
 # Run it. That's all:
