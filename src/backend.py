@@ -336,27 +336,16 @@ class CdpPage:
         return ev
 
 
-def _http_get_json(host, port, path):
-    with socket.create_connection((host, port), timeout=3) as s:
-        s.sendall(
-            f"GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n".encode()
-        )
-        data = b""
-        while True:
-            chunk = s.recv(65536)
-            if not chunk:
-                break
-            data += chunk
-    _, _, body = data.partition(b"\r\n\r\n")
-    try:
-        return json.loads(body.decode("utf-8", "replace"))
-    except ValueError:
-        return None
-
-
 def list_targets(host, port):
+    """List CEF targets. urllib, not a raw socket: the DevTools server answers
+    with keep-alive framing, and a naive read-until-EOF stalls to a timeout and
+    returns nothing — the bug that kept 'targets so far: (none)' forever."""
     for path in ("/json/list", "/json"):
-        got = _http_get_json(host, port, path)
+        try:
+            with urllib.request.urlopen(f"http://{host}:{port}{path}", timeout=3) as resp:
+                got = json.loads(resp.read().decode("utf-8", "replace"))
+        except (urllib.error.URLError, OSError, ValueError):
+            continue
         if isinstance(got, list):
             return got
     return []
