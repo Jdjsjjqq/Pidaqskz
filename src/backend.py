@@ -60,6 +60,23 @@ CFG = {
 # token header is inferred as well; send both common shapes
 TOKEN_HEADERS = ("X-Kernelua-Token", "Authorization")
 
+# expected version of inject.js — bumped whenever the UI script changes;
+# pages carrying an older version are reloaded so the new one takes over
+INJECT_VERSION = 3
+
+LOG_PATH = os.path.join(CFG["state_dir"], "backend.log")
+
+
+def log(msg):
+    line = f"kernelua_backend: {msg}"
+    print(line, flush=True)
+    try:
+        os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
+        with open(LOG_PATH, "a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+    except OSError:
+        pass
+
 
 # ----------------------------------------------------------------- state
 
@@ -449,12 +466,31 @@ def attach_page(host, port, target, cfg, rpc_holder):
     page.call("Runtime.enable")
     page.call("Page.enable")
     page.call("Runtime.addBinding", {"name": cfg["binding"]})
+    # registers the script for every future document in this target
     page.call(
         "Page.addScriptToEvaluateOnNewDocument",
         {"source": inject_src},
     )
-    # inject into pages already open
-    page.call("Runtime.evaluate", {"expression": inject_src, "returnByValue": False})
+
+    # what is already loaded in the live page?
+    cur = 0
+    try:
+        probe = page.call(
+            "Runtime.evaluate",
+            {"expression": "window.__kernelua_loaded_v || 0", "returnByValue": True},
+        )
+        cur = ((probe.get("result") or {}).get("result") or {}).get("value", 0) or 0
+    except (OSError, KeyError, TypeError):
+        cur = 0
+
+    if isinstance(cur, (int, float)) and 0 < cur < INJECT_VERSION:
+        # an old script owns this page: drop it with a reload, the
+        # addScriptToEvaluateOnNewDocument above delivers the new version
+        log(f"page holds inject.js v{int(cur)}, expected v{INJECT_VERSION} -> Page.reload")
+        page.call("Page.reload")
+    elif not cur:
+        # nothing injected here yet — inject into the live page directly
+        page.call("Runtime.evaluate", {"expression": inject_src, "returnByValue": False})
     return page
 
 
@@ -497,7 +533,7 @@ def main():
     try:
         lock = acquire_instance_lock(CFG["sock_name"])
     except OSError:
-        print("kernelua_backend: another instance is running", file=sys.stderr)
+        log("another instance is running")
         return 0
 
     state = State(CFG["state_dir"])
@@ -508,7 +544,7 @@ def main():
     threading.Thread(target=event_loop, args=(pages, CFG, rpc), daemon=True).start()
 
     host, port = CFG["cdp_host"], CFG["cdp_port"]
-    print(f"kernelua_backend: waiting for CDP on {host}:{port}", flush=True)
+    log(f"waiting for CDP on {host}:{port} (inject.js v{INJECT_VERSION})")
     deadline = time.time() + CFG["cdp_ready_timeout"]
     attached = {}  # target id -> CdpPage
 
@@ -548,14 +584,14 @@ def main():
                 page = attach_page(host, port, target, CFG, rpc)
                 if page:
                     attached[tid] = page
-                    print(f"kernelua_backend: injected into {target.get('url')}", flush=True)
+                    log(f"injected into {target.get('url')}")
             except OSError as exc:
-                print(f"kernelua_backend: attach failed: {exc}", file=sys.stderr)
+                log(f"attach failed: {exc}")
 
         pages[:] = list(attached.values())
 
         if not pages and time.time() > deadline:
-            print("kernelua_backend: no steam UI targets found, still waiting", flush=True)
+            log("no steam UI targets found, still waiting")
             deadline = time.time() + 60.0
 
         time.sleep(CFG["poll_interval"])
