@@ -182,6 +182,24 @@ static void spawn_backend(void)
     snprintf(backend, sizeof(backend), "%s/backend.py", so_path);
 
     if (access(backend, X_OK) != 0) {
+        /* lib64/ + lib32/ layout: the .so sits one level below the payload,
+           e.g. .../kernelua/lib32/libkernelua_loader.so -> ../backend.py */
+        char *s2 = strrchr(so_path, '/');
+        if (s2) {
+            *s2 = '\0';
+            char *s3 = strrchr(so_path, '/');
+            if (s3) {
+                size_t parent_len = (size_t)(s3 - so_path);
+                if (parent_len + 12 < sizeof(backend)) {
+                    memcpy(backend, so_path, parent_len);
+                    backend[parent_len] = '\0';
+                    strcat(backend, "/backend.py");
+                }
+            }
+        }
+    }
+
+    if (access(backend, X_OK) != 0) {
         klog("backend.py missing or not executable: %s\n", backend);
         return;
     }
@@ -456,4 +474,4 @@ int posix_spawnp(pid_t *pid, const char *file,
     int r = real_posix_spawnp(pid, file, fa, attr, na ? na : argv, envp);
     free(na);
     return r;
-}
+} 
