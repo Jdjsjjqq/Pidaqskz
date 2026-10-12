@@ -68,8 +68,10 @@ stop_steam() {
     msg "stopping Steam processes"
     killall -q steam steamwebhelper steamservice kernelua_backend 2>/dev/null || true
     # the deployed backend runs as "backend.py" — kill it explicitly,
-    # otherwise the old instance keeps the lock socket and the old script
-    bpid=$(pgrep -f 'kernelua/backend\.py' 2>/dev/null || true)
+    # otherwise the old instance keeps the lock socket and the old script.
+    # anchored pattern: an unanchored 'kernelua/backend.py' regex also matches
+    # the CALLER's own shell whenever its command line merely mentions the path.
+    bpid=$(pgrep -f 'python3 .*/kernelua/backend\.py$' 2>/dev/null || true)
     if [ -n "$bpid" ]; then
         # shellcheck disable=SC2086
         kill -9 $bpid 2>/dev/null || true
@@ -573,6 +575,20 @@ diag() {
             printf '  port %s: down\n' "$cdp"
         fi
     done
+
+    msg "-- CEF targets (/json/list on 9222, else 8080) --"
+    jl=$(curl -fsS --max-time 3 http://127.0.0.1:9222/json/list 2>/dev/null \
+        || curl -fsS --max-time 3 http://127.0.0.1:8080/json/list 2>/dev/null || true)
+    if [ -n "$jl" ]; then
+        printf '%s' "$jl" | python3 -c 'import json,sys
+try:
+    for t in json.load(sys.stdin):
+        print("  [%s] %r | %r" % (t.get("type"), t.get("title"), t.get("url")))
+except Exception as e:
+    print("  (parse error: %s)" % e)'
+    else
+        err "no /json/list on 9222/8080"
+    fi
 
     msg "-- tools --"
     command -v python3 >/dev/null 2>&1 && python3 --version
