@@ -90,7 +90,7 @@ static int is_webhelper(const char *path)
 static int is_steam_client(const char *path)
 {
     const char *b = base_name(path);
-    return strcmp(b, "steam") == 0;
+    return strcmp(b, "steam") == 0 || strcmp(b, "steam.sh") == 0;
 }
 
 /*
@@ -232,17 +232,28 @@ static void init_loader(void)
     if (cmdline[0] == '\0')
         return;
 
-    if (is_steam_client(cmdline)) {
-        klog("client loaded pid=%d\n", (int)getpid());
-        if (backend_already_running()) {
-            klog("backend already running\n");
-        } else {
-            klog("spawning backend\n");
-            spawn_backend();
+    {
+        const char *b = base_name(cmdline);
+        int client = is_steam_client(cmdline);
+        int helper = is_webhelper(cmdline);
+
+        /* breadcrumb for every process we actually care about */
+        if (client || helper)
+            klog("loader loaded pid=%d comm=%s\n", (int)getpid(), b);
+
+        if (client) {
+            /* belt-and-braces: the wrapper normally starts the backend;
+               this ctor path covers launches that skip the wrapper */
+            if (backend_already_running()) {
+                klog("backend already running\n");
+            } else {
+                klog("spawning backend (ctor fallback)\n");
+                spawn_backend();
+            }
         }
+        /* webhelper needs no init work here: the exec hook in the client
+         * process is what rewrites its command line */
     }
-    /* webhelper needs no init work here: the exec hook in the client
-     * process is what rewrites its command line */
 }
 
 /* ------------------------------------------------------------------ */
